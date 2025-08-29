@@ -1,1 +1,90 @@
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+
+import java.util.*;
+
+public class YamlModifier {
+
+    public static String addHeaders(String yamlContent) {
+        Yaml yaml = new Yaml(new SafeConstructor());
+        Map<String, Object> root = yaml.load(yamlContent);
+
+        if (root == null || !root.containsKey("paths")) {
+            return yamlContent; // no paths -> return as-is
+        }
+
+        Map<String, Object> paths = (Map<String, Object>) root.get("paths");
+
+        // loop through all paths
+        for (Object pathObj : paths.values()) {
+            if (!(pathObj instanceof Map)) continue;
+            Map<String, Object> pathItem = (Map<String, Object>) pathObj;
+
+            // loop through all HTTP methods under this path
+            for (Map.Entry<String, Object> methodEntry : pathItem.entrySet()) {
+                if (!(methodEntry.getValue() instanceof Map)) continue;
+                Map<String, Object> operation = (Map<String, Object>) methodEntry.getValue();
+
+                List<Map<String, Object>> parameters =
+                        (List<Map<String, Object>>) operation.getOrDefault("parameters", new ArrayList<>());
+
+                boolean hasCorrelationId = parameters.stream()
+                        .anyMatch(p -> "correlationId".equals(p.get("name")));
+
+                // create new list to avoid anchor issues
+                List<Map<String, Object>> newParams = new ArrayList<>(parameters);
+
+                // always add Authorization
+                newParams.add(createAuthorizationParam());
+
+                // add correlationId only if missing
+                if (!hasCorrelationId) {
+                    newParams.add(createCorrelationIdParam());
+                }
+
+                operation.put("parameters", newParams);
+            }
+        }
+
+        // dump YAML back
+        DumperOptions options = new DumperOptions();
+        options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
+        options.setPrettyFlow(true);
+
+        Yaml dumper = new Yaml(options);
+        return dumper.dump(root);
+    }
+
+    private static Map<String, Object> createAuthorizationParam() {
+        Map<String, Object> param = new LinkedHashMap<>();
+        param.put("name", "Authorization");
+        param.put("in", "header");
+        param.put("required", true);
+        param.put("description", "");
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "string");
+        schema.put("example", "");
+        param.put("schema", schema);
+        return param;
+    }
+
+    private static Map<String, Object> createCorrelationIdParam() {
+        Map<String, Object> param = new LinkedHashMap<>();
+        param.put("name", "correlationId");
+        param.put("in", "header");
+        param.put("required", true);
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "string");
+        param.put("schema", schema);
+        return param;
+    }
+
+    public static void main(String[] args) {
+        String input = "";
+
+        String output = addHeaders(input);
+        System.out.println(output);
+    }
+}
 
