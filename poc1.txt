@@ -1,1 +1,79 @@
+parameters-template.yaml
+
+@Service
+public class YamlHeaderModifierService {
+
+    private final List<Map<String, Object>> templateParams;
+
+    public YamlHeaderModifierService() {
+        this.templateParams = loadTemplateFromClasspath();
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> loadTemplateFromClasspath() {
+        LoaderOptions loaderOptions = new LoaderOptions();
+        Yaml yaml = new Yaml(new SafeConstructor(loaderOptions));
+        try (InputStream in = getClass().getClassLoader().getResourceAsStream("parameters-template.yaml")) {
+            if (in == null) {
+                throw new IllegalStateException("parameters-template.yaml not found in resources");
+            }
+            Map<String, Object> obj = yaml.load(in);
+            return (List<Map<String, Object>>) obj.get("parameters");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load parameters-template.yaml", e);
+        }
+    }
+
+    public String addHeaders(String yamlContent) {
+        LoaderOptions loaderOptions = new LoaderOptions();
+        Yaml yaml = new Yaml(new SafeConstructor(loaderOptions));
+
+        Map<String, Object> yamlMap = yaml.load(yamlContent);
+        if (yamlMap == null || !yamlMap.containsKey("paths")) {
+            return yamlContent; // nothing to modify
+        }
+
+        Map<String, Object> paths = (Map<String, Object>) yamlMap.get("paths");
+
+        for (Object pathValue : paths.values()) {
+            if (pathValue instanceof Map) {
+                Map<String, Object> operations = (Map<String, Object>) pathValue;
+                for (Object opValue : operations.values()) {
+                    if (opValue instanceof Map) {
+                        Map<String, Object> operation = (Map<String, Object>) opValue;
+
+                        List<Map<String, Object>> parameters =
+                                (List<Map<String, Object>>) operation.getOrDefault("parameters", new ArrayList<>());
+
+                        for (Map<String, Object> templateParam : templateParams) {
+                            String name = (String) templateParam.get("name");
+                            if (!parameterExists(parameters, name)) {
+                                parameters.add(templateParam);
+                            }
+                        }
+
+                        operation.put("parameters", parameters);
+                    }
+                }
+            }
+        }
+
+        DumperOptions options = new DumperOptions();
+        options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
+        options.setPrettyFlow(true);
+        options.setIndent(2);
+
+        Representer representer = new Representer(options);
+        Yaml yamlWriter = new Yaml(representer, options);
+
+        StringWriter writer = new StringWriter();
+        yamlWriter.dump(yamlMap, writer);
+        return writer.toString();
+    }
+
+    private boolean parameterExists(List<Map<String, Object>> params, String paramName) {
+        return params.stream().anyMatch(p -> paramName.equalsIgnoreCase((String) p.get("name")));
+    }
+}
+
 
