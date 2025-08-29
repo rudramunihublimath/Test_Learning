@@ -1,1 +1,146 @@
-//TEST
+Example security-template.yaml
+
+components:
+  securitySchemes:
+    apiKeyHeader:
+      type: apiKey
+      name: X-API-KEY
+      in: header
+    apiKeyQuery:
+      type: apiKey
+      name: api_key
+      in: query
+
+security:
+  - apiKeyHeader: []
+  - apiKeyQuery: []
+
+
+-----------------------------
+package com.example.yamlmodifier.service;
+
+import org.springframework.stereotype.Service;
+import org.yaml.snakeyaml.DumperOptions;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
+
+import java.io.InputStream;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.util.*;
+
+@Service
+public class YamlModifierService {
+
+    private final Map<String, Object> securityTemplate;
+
+    // Constructor runs when Spring creates the bean
+    public YamlModifierService() {
+        this.securityTemplate = loadTemplateFromClasspath();
+    }
+
+    private Map<String, Object> loadTemplateFromClasspath() {
+        Yaml yaml = new Yaml(new SafeConstructor());
+        try (InputStream inputStream =
+                     getClass().getClassLoader().getResourceAsStream("security-template.yaml")) {
+            if (inputStream == null) {
+                throw new RuntimeException("security-template.yaml not found in resources!");
+            }
+            return yaml.load(inputStream);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load security-template.yaml", e);
+        }
+    }
+
+    public String updateSpec(String yamlContent) {
+        Yaml yaml = new Yaml(new SafeConstructor());
+        Map<String, Object> yamlData = yaml.load(new StringReader(yamlContent));
+
+        // Ensure components exist
+        Map<String, Object> components = (Map<String, Object>) yamlData.get("components");
+        if (components == null) {
+            components = new LinkedHashMap<>();
+            yamlData.put("components", components);
+        }
+
+        // ✅ Don't touch schemas
+        Map<String, Object> schemas = (Map<String, Object>) components.get("schemas");
+        if (schemas != null) {
+            // leave it as-is
+        }
+
+        // Merge securitySchemes from template
+        Map<String, Object> templateComponents = (Map<String, Object>) securityTemplate.get("components");
+        if (templateComponents != null) {
+            Map<String, Object> templateSecuritySchemes =
+                    (Map<String, Object>) templateComponents.get("securitySchemes");
+
+            if (templateSecuritySchemes != null) {
+                Map<String, Object> securitySchemes =
+                        (Map<String, Object>) components.get("securitySchemes");
+
+                if (securitySchemes == null) {
+                    securitySchemes = new LinkedHashMap<>();
+                    components.put("securitySchemes", securitySchemes);
+                }
+
+                for (Map.Entry<String, Object> entry : templateSecuritySchemes.entrySet()) {
+                    securitySchemes.putIfAbsent(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+
+        // Merge root security from template
+        List<Object> templateSecurityList = (List<Object>) securityTemplate.get("security");
+        if (templateSecurityList != null) {
+            List<Object> securityList = (List<Object>) yamlData.get("security");
+            if (securityList == null) {
+                securityList = new ArrayList<>();
+                yamlData.put("security", securityList);
+            }
+            for (Object sec : templateSecurityList) {
+                if (!securityList.contains(sec)) {
+                    securityList.add(sec);
+                }
+            }
+        }
+
+        // Dump back to String
+        DumperOptions options = new DumperOptions();
+        options.setPrettyFlow(true);
+        options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
+        Yaml outputYaml = new Yaml(options);
+
+        StringWriter writer = new StringWriter();
+        outputYaml.dump(yamlData, writer);
+        return writer.toString();
+    }
+}
+
+
+-----------------------------
+
+
+package com.example.yamlmodifier.controller;
+
+import com.example.yamlmodifier.service.YamlModifierService;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/yaml")
+public class YamlModifierController {
+
+    private final YamlModifierService service;
+
+    public YamlModifierController(YamlModifierService service) {
+        this.service = service;
+    }
+
+    @PostMapping("/update")
+    public String updateSpec(@RequestBody String yamlContent) {
+        return service.updateSpec(yamlContent);
+    }
+}
+
+
+--------------------
