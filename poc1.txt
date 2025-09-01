@@ -1,1 +1,64 @@
+@RestController
+@RequestMapping("/")
+public class TfvarsController {
 
+    private static final Path BASE_DIR = Path.of("environment");
+
+    @PostMapping("/update")
+    public ResponseEntity<List<Map<String, String>>> updateAllTfvars(
+            @RequestParam(required = false) String code,
+            @RequestParam(required = false) String spn) throws IOException {
+
+        List<Map<String, String>> results = new ArrayList<>();
+
+        // Traverse environment/ recursively for terraform.tfvars files
+        Files.walk(BASE_DIR)
+                .filter(p -> p.getFileName().toString().equals("terraform.tfvars"))
+                .forEach(path -> {
+                    try {
+                        String updatedScope = updateScopeVal(path, code, spn);
+                        if (updatedScope != null) {
+                            Map<String, String> res = new LinkedHashMap<>();
+                            res.put("file", path.toString());
+                            res.put("env", detectEnv(updatedScope));
+                            res.put("updatedScopeVal", updatedScope);
+                            results.add(res);
+
+                            // Console log
+                            System.out.printf("Updated %s => %s%n", path, updatedScope);
+                        }
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+        return ResponseEntity.ok(results);
+    }
+
+    private String updateScopeVal(Path path, String code, String spn) throws IOException {
+        List<String> lines = Files.readAllLines(path);
+        String newScope = null;
+
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).trim().startsWith("ScopeVal")) {
+                String scopeVal = lines.get(i).split("=", 2)[1].trim().replace("\"", "");
+                String[] parts = scopeVal.split("/");
+
+                if (code != null && !code.isEmpty()) parts[2] = code;   // replace Code
+                if (spn != null && !spn.isEmpty()) parts[4] = spn;     // replace SPN
+
+                newScope = String.join("/", parts);
+                lines.set(i, "ScopeVal = \"" + newScope + "\"");
+                break;
+            }
+        }
+
+        if (newScope != null) Files.write(path, lines);
+        return newScope;
+    }
+
+    private String detectEnv(String scopeVal) {
+        if (scopeVal.contains("/DEV/")) return "DEV";       
+        return "UNKNOWN";
+    }
+}
