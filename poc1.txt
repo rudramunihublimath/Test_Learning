@@ -1,1 +1,66 @@
 
+------------
+
+@Service
+public class GitLabService {
+
+    @Value("${gitlab.api.url}")
+    private String gitlabApiUrl;
+
+    @Value("${gitlab.project.id}")
+    private String projectId;
+
+    @Value("${gitlab.admin.token}")
+    private String adminToken;
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    public String createProjectAccessTokenAndVariables() {
+        // 1. Create the Project Access Token
+        String url = String.format("%s/projects/%s/access_tokens", gitlabApiUrl, projectId);
+
+        MultiValueMap<String, Object> request = new LinkedMultiValueMap<>();
+        request.add("name", "pat_token");
+        request.add("scopes[]", Arrays.asList("api", "xyz"));               // adjust required scopes
+        // request.add("expires_at", "2025-10-08");   // optional
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("PRIVATE-TOKEN", adminToken);
+
+        HttpEntity<MultiValueMap<String, Object>> entity = new HttpEntity<>(request, headers);
+
+        ResponseEntity<Map> response = restTemplate.postForEntity(url, entity, Map.class);
+        if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
+            throw new RuntimeException("Failed to create project access token: " + response.getStatusCode());
+        }
+        String tokenValue = (String) response.getBody().get("token");
+        if (tokenValue == null) {
+            throw new RuntimeException("Token value not returned by GitLab");
+        }
+
+        // 2. Create CI/CD variable: pat_name = pat_token
+        createProjectVariable("pat_name", "pat_token", headers);
+
+        // 3. Create CI/CD variable: pat_token = <actual token value>
+        createProjectVariable("pat_token", tokenValue, headers);
+
+        return tokenValue;
+    }
+
+    private void createProjectVariable(String key, String value, HttpHeaders headers) {
+        String varUrl = String.format("%s/projects/%s/variables", gitlabApiUrl, projectId);
+
+        MultiValueMap<String, Object> varRequest = new LinkedMultiValueMap<>();
+        varRequest.add("key", key);
+        varRequest.add("value", value);
+        // optionally add: varRequest.add("protected", "false");
+        // varRequest.add("masked", "false");
+
+        HttpEntity<MultiValueMap<String, Object>> varEntity = new HttpEntity<>(varRequest, headers);
+        ResponseEntity<Map> varResponse = restTemplate.postForEntity(varUrl, varEntity, Map.class);
+
+        if (!varResponse.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Failed to create CI/CD variable: " + key);
+        }
+    }
+}
