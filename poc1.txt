@@ -1,1 +1,16 @@
 
+// Find project ID by project name
+public Long getProjectIdByName(String projectName) {
+    String url = gitlabBaseUrl + "/projects?search=" + UriUtils.encode(projectName, StandardCharsets.UTF_8);
+    HttpHeaders headers = new HttpHeaders();
+    headers.set("PRIVATE-TOKEN", personalAccessToken);
+
+    HttpEntity<Void> request = new HttpEntity<>(headers);
+    ResponseEntity<List> response = restTemplate.exchange(url, HttpMethod.GET, request, List.class);
+
+    if (response.getBody() != null && !response.getBody().isEmpty()) {
+        Map<?, ?> project = (Map<?, ?>) response.getBody().get(0); // take first matching project
+        return ((Number) project.get("id")).longValue();
+    }
+    throw new RuntimeException("Project not found: " + projectName);
+}
