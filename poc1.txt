@@ -1,1 +1,436 @@
 
+package com.example.gitlab.service;
+
+import com.example.gitlab.config.GitLabProperties;
+import com.example.gitlab.model.CloneResult;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.Instant;
+import java.util.*;
+
+/**
+ * GitLabApiService
+ *
+ * Uses tar.gz format for archive — supported by ALL GitLab instances including
+ * self-hosted (devcloud / on-prem). ZIP is disabled on many self-hosted instances.
+ *
+ * Operations:
+ *   1. cloneRepository()  — downloads branch tar.gz → extracts to Temp2 dir
+ *   2. getClonedPath()    — returns the absolute local extraction path
+ *   3. createReadme()     — writes README.md into the cloned directory
+ *   4. pushChanges()      — commits README.md back to GitLab via Files API
+ */
+@Service
+public class GitLabApiService {
+
+    private static final Logger log = LoggerFactory.getLogger(GitLabApiService.class);
+
+    // Try formats in this order — tar.gz works on ALL GitLab instances
+    private static final String[] ARCHIVE_FORMATS = { "tar.gz", "tar.bz2", "tar" };
+
+    private final GitLabProperties props;
+    private final HttpClient       httpClient;
+    private final ObjectMapper     objectMapper;
+
+    @Autowired
+    public GitLabApiService(GitLabProperties props) {
+        this.props        = props;
+        this.httpClient   = HttpClient.newBuilder()
+                                .version(HttpClient.Version.HTTP_1_1)
+                                .build();
+        this.objectMapper = new ObjectMapper();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 1 — CLONE  (GitLab Archive API → ZIP download → extract)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * "Clones" the repository by downloading the branch as a ZIP archive
+     * via GitLab API, then extracting it to the Temp2 directory.
+     *
+     * GitLab API used:
+     *   GET /api/v4/projects/:encoded_path/repository/archive?sha=branch&format=zip
+     *
+     * @return CloneResult with clonedPath (absolute) and HEAD commit SHA
+     */
+    public CloneResult cloneRepository() throws Exception {
+
+        String encodedProject = urlEncode(props.getProjectPath());
+        String encodedBranch  = urlEncode(props.getBranchname());
+        String apiBase        = props.getApiBaseUrl();
+
+        log.info("=== STEP 1: CLONE ===");
+        log.info("GITLABURL   : {}", props.getGitlabUrl());
+        log.info("Project     : {}", props.getProjectPath());
+        log.info("Branch      : {}", props.getBranchname());
+        log.info("Temp2       : {}", props.getTemp2());
+
+        // Ensure Temp2 directory exists (like mkdir -p)
+        Path temp2Root = Paths.get(props.getTemp2());
+        Files.createDirectories(temp2Root);
+
+        // Unique clone dir: e.g. Credit-feature/
+        String subdirName = props.getProjectName() + "-"
+                + props.getBranchname().replace("/", "_").replace("\\", "_");
+        Path cloneRoot = temp2Root.resolve(subdirName);
+
+        if (Files.exists(cloneRoot)) {
+            deleteDirectory(cloneRoot);
+        }
+        Files.createDirectories(cloneRoot);
+
+        // ── Try each format until one succeeds ────────────────────────────────
+        boolean extracted = false;
+        for (String format : ARCHIVE_FORMATS) {
+            String archiveUrl = String.format(
+                "%s/api/v4/projects/%s/repository/archive?sha=%s&format=%s",
+                apiBase, encodedProject, encodedBranch, format
+            );
+            log.info("Trying archive format [{}] → {}", format, archiveUrl);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(archiveUrl))
+                    .header("PRIVATE-TOKEN", props.getToken())
+                    .header("Accept", "*/*")
+                    .GET()
+                    .build();
+
+            HttpResponse<InputStream> response =
+                    httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+
+            if (response.statusCode() != 200) {
+                byte[] body = response.body().readAllBytes();
+                log.warn("Format [{}] rejected [HTTP {}]: {}",
+                        format, response.statusCode(),
+                        new String(body, StandardCharsets.UTF_8));
+                continue; // try next format
+            }
+
+            log.info("Format [{}] accepted — extracting...", format);
+            extractTarGz(response.body(), cloneRoot);
+            extracted = true;
+            log.info("Extraction complete using format: {}", format);
+            break;
+        }
+
+        if (!extracted) {
+            throw new RuntimeException(
+                "GitLab archive API failed for all formats (tar.gz, tar.bz2, tar). " +
+                "Check GitLab instance version and PRIVATE-TOKEN scopes " +
+                "(needs read_repository)."
+            );
+        }
+
+        // GitLab archive puts all files inside a single root folder — find it
+        Path repoPath = Files.list(cloneRoot)
+                .filter(Files::isDirectory)
+                .findFirst()
+                .orElse(cloneRoot);
+
+        String headSha = fetchHeadCommitSha();
+
+        log.info("Cloned to   : {}", repoPath.toAbsolutePath());
+        log.info("HEAD SHA    : {}", headSha);
+
+        return new CloneResult(repoPath.toAbsolutePath().toString(), headSha);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 2 — GET CLONED PATH  (returned by cloneRepository)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the expected cloned directory path without performing a clone.
+     * Useful to inspect the path before or after cloning.
+     */
+    public String getExpectedClonePath() {
+        String subdirName = props.getProjectName() + "-" + props.getBranchname()
+                                 .replace("/", "_").replace("\\", "_");
+        Path temp2Root = Paths.get(props.getTemp2());
+        return temp2Root.resolve(subdirName).toAbsolutePath().toString();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 3 — CREATE README.md  (local file write)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Creates README.md at the root of the cloned directory.
+     * Content is generated from GitLab config metadata.
+     *
+     * @param clonedPath  absolute path returned from cloneRepository()
+     * @return            Path to the created README.md file
+     */
+    public Path createReadme(String clonedPath) throws IOException {
+
+        log.info("=== STEP 3: CREATE README ===");
+
+        Path readmePath = Paths.get(clonedPath, "README.md");
+        String content  = buildReadmeContent();
+
+        Files.writeString(readmePath, content, StandardCharsets.UTF_8);
+
+        log.info("README.md created at: {}", readmePath.toAbsolutePath());
+        return readmePath;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STEP 4 — PUSH  (GitLab Repository Files API — POST or PUT)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Pushes README.md back to GitLab on the configured branch.
+     *
+     * GitLab APIs used:
+     *   HEAD /api/v4/projects/:path/repository/files/README.md?ref=branch
+     *        → decides POST (new file) vs PUT (update existing)
+     *   POST /api/v4/projects/:path/repository/files/README.md
+     *   PUT  /api/v4/projects/:path/repository/files/README.md
+     *
+     * @param clonedPath  local path containing README.md
+     * @return            GitLab API response body (JSON)
+     */
+    public String pushChanges(String clonedPath) throws Exception {
+
+        log.info("=== STEP 4: PUSH ===");
+
+        Path readmePath     = Paths.get(clonedPath, "README.md");
+        String rawContent   = Files.readString(readmePath, StandardCharsets.UTF_8);
+        String base64Content = Base64.getEncoder()
+                                     .encodeToString(rawContent.getBytes(StandardCharsets.UTF_8));
+
+        String encodedProject  = urlEncode(props.getProjectPath());
+        String encodedFilePath  = urlEncode("README.md");
+        String apiBase         = props.getApiBaseUrl();
+
+        String filesUrl = String.format(
+            "%s/api/v4/projects/%s/repository/files/%s",
+            apiBase, encodedProject, encodedFilePath
+        );
+
+        boolean fileExists = checkRemoteFileExists("README.md");
+        String httpMethod  = fileExists ? "PUT" : "POST";
+
+        log.info("README.md on remote branch: {}", fileExists ? "EXISTS → PUT" : "NEW → POST");
+        log.info("Files API URL: {}", filesUrl);
+
+        // Payload
+        Map<String, String> payload = new LinkedHashMap<>();
+        payload.put("branch",         props.getBranchname());
+        payload.put("content",        base64Content);
+        payload.put("encoding",       "base64");
+        payload.put("commit_message",
+            "chore: add/update README.md via GitLab API [Azure-WebApp-automated] " + Instant.now());
+
+        String jsonBody = objectMapper.writeValueAsString(payload);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(filesUrl))
+                .header("PRIVATE-TOKEN", props.getToken())
+                .header("Content-Type",  "application/json")
+                .method(httpMethod, HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        HttpResponse<String> response =
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        int status = response.statusCode();
+        if (status == 200 || status == 201) {
+            log.info("Push successful [HTTP {}]. Branch: {}", status, props.getBranchname());
+            return response.body();
+        } else {
+            throw new RuntimeException(
+                "Push failed [HTTP " + status + "]: " + response.body()
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Fetch the HEAD commit SHA of the configured branch */
+    private String fetchHeadCommitSha() throws Exception {
+        String encodedProject = urlEncode(props.getProjectPath());
+        String encodedBranch  = urlEncode(props.getBranchname());
+        String url = String.format(
+            "%s/api/v4/projects/%s/repository/branches/%s",
+            props.getApiBaseUrl(), encodedProject, encodedBranch
+        );
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("PRIVATE-TOKEN", props.getToken())
+                .GET()
+                .build();
+
+        HttpResponse<String> response =
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            log.warn("Could not fetch branch SHA [{}], using 'unknown'", response.statusCode());
+            return "unknown";
+        }
+
+        JsonNode root = objectMapper.readTree(response.body());
+        return root.path("commit").path("id").asText("unknown");
+    }
+
+    /**
+     * HEAD request to check if a file already exists on the remote branch.
+     * Returns true if HTTP 200, false otherwise.
+     */
+    private boolean checkRemoteFileExists(String filePath) {
+        try {
+            String encodedProject  = urlEncode(props.getProjectPath());
+            String encodedFilePath  = urlEncode(filePath);
+            String encodedBranch   = urlEncode(props.getBranchname());
+            String url = String.format(
+                "%s/api/v4/projects/%s/repository/files/%s?ref=%s",
+                props.getApiBaseUrl(), encodedProject, encodedFilePath, encodedBranch
+            );
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("PRIVATE-TOKEN", props.getToken())
+                    .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                    .build();
+
+            HttpResponse<Void> response =
+                    httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+
+            return response.statusCode() == 200;
+
+        } catch (Exception e) {
+            log.warn("File existence check failed, defaulting to POST (create). Error: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PRIVATE — tar.gz / tar extraction  (replaces ZIP)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Extracts a tar.gz or plain tar InputStream into targetDir.
+     * Uses Apache Commons Compress.
+     * Includes tar-slip (path traversal) protection.
+     */
+    private void extractTarGz(InputStream inputStream, Path targetDir) throws IOException {
+
+        BufferedInputStream buffered = new BufferedInputStream(inputStream);
+
+        // Try gzip decompression first; fall back to plain tar
+        InputStream decompressed;
+        try {
+            decompressed = new GzipCompressorInputStream(buffered);
+            log.debug("Archive is gzip-compressed (tar.gz)");
+        } catch (IOException e) {
+            log.info("Not gzip, treating as plain tar");
+            decompressed = buffered;
+        }
+
+        try (TarArchiveInputStream tar = new TarArchiveInputStream(decompressed)) {
+            TarArchiveEntry entry;
+            while ((entry = tar.getNextEntry()) != null) {
+
+                Path entryPath = targetDir.resolve(entry.getName()).normalize();
+
+                // Tar-slip protection
+                if (!entryPath.startsWith(targetDir)) {
+                    throw new SecurityException("Tar slip attack detected: " + entry.getName());
+                }
+
+                if (entry.isDirectory()) {
+                    Files.createDirectories(entryPath);
+                } else {
+                    Files.createDirectories(entryPath.getParent());
+                    try (OutputStream out = Files.newOutputStream(entryPath)) {
+                        tar.transferTo(out);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Recursively deletes a directory */
+    private void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        Files.walk(dir)
+             .sorted(Comparator.reverseOrder())
+             .forEach(p -> {
+                 try { Files.delete(p); }
+                 catch (IOException e) { log.warn("Could not delete: {}", p); }
+             });
+    }
+
+    /** URL-encode a string for GitLab API path segments */
+    private String urlEncode(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    /** Builds README.md content */
+    private String buildReadmeContent() {
+        return String.format("""
+                # %s
+                
+                > Auto-generated by **GitLab API Java Service** running on Azure App Service
+                
+                ## Repository Info
+                
+                | Property     | Value                                    |
+                |--------------|------------------------------------------|
+                | GitLab URL   | `%s`                                     |
+                | Project Path | `%s`                                     |
+                | Branch       | `%s`                                     |
+                | Temp Dir     | `%s`                                     |
+                | Generated At | `%s`                                     |
+                
+                ## How This File Was Created
+                
+                This README was committed using the **GitLab REST API** — no Git CLI involved.
+                The service runs as a JAR deployed on **Azure Web App**.
+                
+                ### GitLab APIs Used
+                
+                | Operation | Endpoint |
+                |-----------|----------|
+                | Clone (ZIP download) | `GET /repository/archive?sha={branch}&format=zip` |
+                | Branch HEAD SHA      | `GET /repository/branches/{branch}` |
+                | File existence check | `HEAD /repository/files/README.md?ref={branch}` |
+                | Push file            | `POST` or `PUT /repository/files/README.md` |
+                
+                ---
+                *Managed by automation — manual edits may be overwritten.*
+                """,
+            props.getProjectName(),
+            props.getGitlabUrl(),
+            props.getProjectPath(),
+            props.getBranchname(),
+            props.getTemp2(),
+            Instant.now().toString()
+        );
+    }
+}
+
+
+<dependency>
+    <groupId>org.apache.commons</groupId>
+    <artifactId>commons-compress</artifactId>
+    <version>1.26.1</version>
+</dependency>
