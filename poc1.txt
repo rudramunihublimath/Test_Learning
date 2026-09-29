@@ -1,1 +1,24 @@
 
+
+Develope REACT UI >>
+Give me sample "React code" with below features in it : 
+1. Home page with beutifil logo at top side and Ttile name; 
+2. Table format with 3 column (API NAME , API INFO , API FORM ) : 
+    @left side, keep 3 ref link  
+	&@Center , disaplce text information about this API features 
+	& @right side load its form on click.   
+    a) Create New API   - POST Method to call Sping boot Java code 
+	b) Update Spec API  - POST Method to call Sping boot Java code 
+	c) Change Scope     - POST Method to call Sping boot Java code 
+	c) Download Spec 	- POST Method to call Sping boot Java code 
+	d) Health Check - Get Method to call Sping boot Java code
+3. after clicking each link , there respective form should be loaded ; 
+4. "Update Spec API" Form will be like : 
+   xHeaders - Yes / No   (select from Drop down)
+   CommitMessage - Text 
+   SPNValue - SPN / UAMI (select from Drop down)
+   yamlFile - (Broswe yaml file from local machine and give as input) 
+5. Submitted form will go to Provider Spring boot code from Reach and Spring boot api will response 
+   a) SUCCESS - if all ok , 200 
+   b) FAILURE text error - if any issue (4**/5** code)  - so return as "ERROR"
+   SUCCESS or ERROR response should be notified in UI to user. 
